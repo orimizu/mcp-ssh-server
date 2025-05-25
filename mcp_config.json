@@ -1,0 +1,18 @@
+{
+    "mcpServers": {
+        "ssh-command-server": {
+            "command": "D:\\work\\BOT-Project\\SSH-Connector\\mcp-ssh-server\\venv\\Scripts\\python.exe",
+            "args": [
+                "D:\\work\\BOT-Project\\SSH-Connector\\mcp-ssh-server\\src\\mcp_ssh_server_profile.py",
+                "--debug",
+                "--log-file",
+                "D:\\work\\BOT-Project\\SSH-Connector\\mcp-ssh-server\\log\\ssh-command-server-debug_log.txt"
+            ],
+            "env": {
+                "PYTHONUTF8": "1",
+                "PYTHONPATH": "D:\\work\\BOT-Project\\SSH-Connector\\mcp-ssh-server",
+                "PYTHONUNBUFFERED": "1"
+            }
+        }
+    }
+}
