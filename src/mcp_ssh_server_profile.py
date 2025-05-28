@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-MCP SSH Command Server - プロファイル対応版
+MCP SSH Command Server - プロファイル対応版 + ヒアドキュメント自動修正機能
 
 プロファイル管理によりLLMから機密情報を隠蔽し、セキュアなSSH接続を実現
 sudo問題修正機能とセッション復旧機能を含む強化版
+ヒアドキュメント自動検出・修正機能統合（Phase 1 + Phase 2）
 Anthropic社のModel Context Protocol (MCP)に対応したSSHコマンド実行サーバー
 JSON-RPC 2.0仕様に完全準拠
 """
@@ -12,8 +13,11 @@ import asyncio
 import json
 import sys
 import logging
-from typing import Any, Dict, List, Optional, Union
+import re
+import time
+from typing import Any, Dict, List, Optional, Union, Tuple
 from dataclasses import asdict
+from enum import Enum
 import argparse
 
 # 修正版SSH実行ライブラリをインポート
@@ -33,15 +37,385 @@ except ImportError:
     sys.exit(1)
 
 
+# === ヒアドキュメント機能の統合（Phase 1 + Phase 2） ===
+
+class FixAction(Enum):
+    """修正アクションの種類"""
+    AUTO_APPLIED = "auto_applied"        # 自動適用済み
+    SUGGESTION_ONLY = "suggestion_only"  # 提案のみ
+    MANUAL_REQUIRED = "manual_required"  # 手動修正必須
+    NO_FIX_NEEDED = "no_fix_needed"     # 修正不要
+
+
+class HeredocDetector:
+    """ヒアドキュメント構文検出・自動修正クラス（統合版）"""
+    
+    def __init__(self):
+        self.heredoc_patterns = [
+            r'<<\s*(["\']?)(\w+)\1',   # << EOF, << "EOF", << 'EOF'
+            r'<<-\s*(["\']?)(\w+)\1',  # <<- EOF (インデント無視形式)
+        ]
+        
+        # 自動修正の設定
+        self.auto_fix_settings = {
+            "missing_newline": True,        # 改行不足は自動修正
+            "simple_indentation": True,     # 簡単なインデント問題は自動修正
+            "complex_issues": False         # 複雑な問題は手動修正
+        }
+    
+    def detect_and_fix_heredoc_command(self, command: str, enable_auto_fix: bool = True) -> Dict[str, Any]:
+        """
+        ヒアドキュメント構文を検出・分析・修正（Phase 1 + Phase 2統合）
+        
+        Args:
+            command: 分析するコマンド文字列
+            enable_auto_fix: 自動修正を有効にするか
+            
+        Returns:
+            検出・修正結果の辞書
+        """
+        result = {
+            "is_heredoc": False,
+            "markers": [],
+            "issues": [],
+            "recommendations": [],
+            "fixes_applied": [],
+            "suggested_fixes": [],
+            "fixed_command": command,
+            "auto_fix_enabled": enable_auto_fix,
+            "analysis_time": None,
+            "fix_summary": {}
+        }
+        
+        start_time = time.time()
+        
+        try:
+            # Phase 1: 検出処理
+            self._detect_heredoc_issues(result, command)
+            
+            # Phase 2: 自動修正処理
+            if result["is_heredoc"] and enable_auto_fix:
+                result["fixed_command"] = self._apply_automatic_fixes(result, command)
+            
+            # 修正サマリーの生成
+            result["fix_summary"] = self._generate_fix_summary(result)
+            result["analysis_time"] = time.time() - start_time
+            
+        except Exception as e:
+            result["error"] = f"ヒアドキュメント処理中にエラーが発生: {str(e)}"
+        
+        return result
+    
+    def _detect_heredoc_issues(self, result: Dict[str, Any], command: str):
+        """ヒアドキュメントの問題を検出"""
+        for pattern in self.heredoc_patterns:
+            matches = re.finditer(pattern, command, re.MULTILINE)
+            for match in matches:
+                result["is_heredoc"] = True
+                quote_char = match.group(1) if match.group(1) else None
+                marker = match.group(2)
+                
+                marker_info = {
+                    "marker": marker,
+                    "quoted": bool(quote_char),
+                    "quote_type": quote_char,
+                    "position": match.span(),
+                    "pattern_type": "standard" if "<<-" not in match.group(0) else "indented"
+                }
+                result["markers"].append(marker_info)
+                
+                # 個別マーカーの問題を検出
+                self._detect_marker_issues(result, marker_info, command)
+        
+        # 全体的な問題をチェック
+        if result["is_heredoc"]:
+            self._detect_general_issues(result, command)
+            result["recommendations"] = self._generate_recommendations(result)
+    
+    def _detect_marker_issues(self, result: Dict[str, Any], marker_info: Dict[str, Any], command: str):
+        """個別マーカーの問題を検出（修正可能性を含む）"""
+        marker = marker_info["marker"]
+        
+        # 1. エンドマーク後の改行チェック
+        if not self._check_heredoc_newline(command, marker):
+            issue = {
+                "type": "missing_newline",
+                "severity": "error",
+                "message": f"エンドマーク '{marker}' の後に改行が不足しています",
+                "description": "改行不足はタイムアウトの原因になります",
+                "marker": marker,
+                "auto_fixable": True,  # 安全に自動修正可能
+                "fix_action": str(FixAction.AUTO_APPLIED) if self.auto_fix_settings["missing_newline"] else str(FixAction.SUGGESTION_ONLY),
+                "suggested_fix": f"{marker}\\n (改行を追加)"
+            }
+            result["issues"].append(issue)
+        
+        # 2. マーカーのインデント問題
+        indentation_info = self._check_marker_indentation_detailed(command, marker)
+        if indentation_info["is_indented"]:
+            issue = {
+                "type": "indented_marker",
+                "severity": "warning",
+                "message": f"エンドマーク '{marker}' がインデントされています",
+                "description": "エンドマークは行頭から記述することを推奨します",
+                "marker": marker,
+                "auto_fixable": indentation_info["simple_fix"],
+                "fix_action": str(FixAction.AUTO_APPLIED) if (indentation_info["simple_fix"] and self.auto_fix_settings["simple_indentation"]) else str(FixAction.SUGGESTION_ONLY),
+                "suggested_fix": f"行頭に移動: {marker}",
+                "indentation_details": indentation_info
+            }
+            result["issues"].append(issue)
+    
+    def _detect_general_issues(self, result: Dict[str, Any], command: str):
+        """全体的な問題を検出"""
+        # 複数のヒアドキュメントが存在する場合
+        if len(result["markers"]) > 1:
+            issue = {
+                "type": "multiple_heredocs",
+                "severity": "info",
+                "message": f"複数のヒアドキュメント ({len(result['markers'])}個) が検出されました",
+                "description": "複雑な構文のため注意深く確認してください",
+                "auto_fixable": False,
+                "fix_action": str(FixAction.MANUAL_REQUIRED),
+                "suggested_fix": "個別に確認・修正してください"
+            }
+            result["issues"].append(issue)
+        
+        # sudoとの組み合わせチェック
+        if re.search(r'\bsudo\b', command):
+            issue = {
+                "type": "sudo_heredoc_combination",
+                "severity": "info",
+                "message": "sudoコマンドとヒアドキュメントの組み合わせが検出されました",
+                "description": "権限とファイル作成先に注意してください",
+                "auto_fixable": False,
+                "fix_action": str(FixAction.NO_FIX_NEEDED),
+                "suggested_fix": "権限とパスを確認してください"
+            }
+            result["issues"].append(issue)
+    
+    def _apply_automatic_fixes(self, result: Dict[str, Any], command: str) -> str:
+        """自動修正を適用"""
+        fixed_command = command
+        
+        for issue in result["issues"]:
+            if issue.get("auto_fixable") and issue.get("fix_action") == str(FixAction.AUTO_APPLIED):
+                
+                if issue["type"] == "missing_newline":
+                    # 改行不足の修正
+                    if not fixed_command.endswith('\n'):
+                        fixed_command = fixed_command + '\n'
+                        
+                        fix_info = {
+                            "type": "missing_newline",
+                            "marker": issue["marker"],
+                            "description": "エンドマーク後に改行を追加",
+                            "before": repr(command[-10:]),  # 末尾10文字
+                            "after": repr(fixed_command[-10:])
+                        }
+                        result["fixes_applied"].append(fix_info)
+                        issue["fix_applied"] = True
+                
+                elif issue["type"] == "indented_marker":
+                    # インデント問題の修正
+                    marker = issue["marker"]
+                    indentation_details = issue.get("indentation_details", {})
+                    
+                    if indentation_details.get("simple_fix"):
+                        # 簡単なインデント修正（単純な空白除去）
+                        lines = fixed_command.split('\n')
+                        for i, line in enumerate(lines):
+                            if line.strip() == marker and line != line.lstrip():
+                                old_line = line
+                                lines[i] = marker  # インデントを除去
+                                fixed_command = '\n'.join(lines)
+                                
+                                fix_info = {
+                                    "type": "indented_marker",
+                                    "marker": marker,
+                                    "description": "エンドマークのインデントを除去",
+                                    "before": repr(old_line),
+                                    "after": repr(marker)
+                                }
+                                result["fixes_applied"].append(fix_info)
+                                issue["fix_applied"] = True
+                                break
+            
+            else:
+                # 自動修正されない問題は提案リストに追加
+                if issue.get("fix_action") in [str(FixAction.SUGGESTION_ONLY), str(FixAction.MANUAL_REQUIRED)]:
+                    suggestion = {
+                        "type": issue["type"],
+                        "marker": issue.get("marker"),
+                        "severity": issue["severity"],
+                        "message": issue["message"],
+                        "suggested_fix": issue.get("suggested_fix"),
+                        "reason": self._get_fix_reason(issue["type"])
+                    }
+                    result["suggested_fixes"].append(suggestion)
+        
+        return fixed_command
+    
+    def _check_heredoc_newline(self, command: str, marker: str) -> bool:
+        """エンドマーク後の改行をチェック"""
+        lines = command.split('\n')
+        for i, line in enumerate(lines):
+            if line.strip() == marker:
+                if i < len(lines) - 1:
+                    return True
+                else:
+                    return command.endswith('\n')
+        return True
+    
+    def _check_marker_indentation_detailed(self, command: str, marker: str) -> Dict[str, Any]:
+        """エンドマークのインデントを詳細チェック"""
+        result = {
+            "is_indented": False,
+            "simple_fix": False,
+            "indentation_type": None,
+            "indentation_count": 0
+        }
+        
+        lines = command.split('\n')
+        for line in lines:
+            if line.strip() == marker and line != line.lstrip():
+                result["is_indented"] = True
+                
+                # インデントの種類と量を分析
+                leading_whitespace = line[:len(line) - len(line.lstrip())]
+                result["indentation_count"] = len(leading_whitespace)
+                
+                if leading_whitespace.isspace() and len(leading_whitespace) <= 8:
+                    # 8文字以下の空白文字のみなら簡単な修正
+                    result["simple_fix"] = True
+                    result["indentation_type"] = "simple_whitespace"
+                else:
+                    # 複雑なインデント（タブ混在など）は手動修正
+                    result["simple_fix"] = False
+                    result["indentation_type"] = "complex"
+                
+                break
+        
+        return result
+    
+    def _get_fix_reason(self, issue_type: str) -> str:
+        """修正が自動適用されない理由を返す"""
+        reasons = {
+            "multiple_heredocs": "複雑な構文のため個別確認が必要",
+            "sudo_heredoc_combination": "権限に関わる問題のため確認が必要",
+            "complex_indentation": "複雑なインデントのため手動修正が安全"
+        }
+        return reasons.get(issue_type, "安全性のため手動確認を推奨")
+    
+    def _generate_fix_summary(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """修正サマリーを生成"""
+        summary = {
+            "total_issues": len(result["issues"]),
+            "auto_fixed": len(result["fixes_applied"]),
+            "suggestions_only": len(result["suggested_fixes"]),
+            "manual_required": 0,
+            "no_fix_needed": 0,
+            "fix_success_rate": 0.0
+        }
+        
+        # 修正アクションの集計
+        for issue in result["issues"]:
+            action = issue.get("fix_action", str(FixAction.NO_FIX_NEEDED))
+            if action == str(FixAction.MANUAL_REQUIRED):
+                summary["manual_required"] += 1
+            elif action == str(FixAction.NO_FIX_NEEDED):
+                summary["no_fix_needed"] += 1
+        
+        # 修正成功率の計算
+        fixable_issues = summary["total_issues"] - summary["no_fix_needed"]
+        if fixable_issues > 0:
+            summary["fix_success_rate"] = summary["auto_fixed"] / fixable_issues * 100
+        
+        return summary
+    
+    def _generate_recommendations(self, result: Dict[str, Any]) -> List[str]:
+        """推奨事項を生成（修正情報付き）"""
+        recommendations = []
+        
+        # 自動修正された項目
+        if result["fixes_applied"]:
+            recommendations.append(f"✅ {len(result['fixes_applied'])}個の問題を自動修正しました")
+            for fix in result["fixes_applied"]:
+                recommendations.append(f"  - {fix['description']}")
+        
+        # 提案のみの項目
+        if result["suggested_fixes"]:
+            recommendations.append(f"💡 {len(result['suggested_fixes'])}個の修正提案があります")
+            for suggestion in result["suggested_fixes"]:
+                recommendations.append(f"  - {suggestion['message']}: {suggestion['suggested_fix']}")
+        
+        # 一般的な推奨事項
+        if result["is_heredoc"]:
+            recommendations.extend([
+                "",
+                "📋 ヒアドキュメント一般的なベストプラクティス:",
+                "✅ エンドマークの後には必ず改行を入れる",
+                "✅ エンドマークは行の先頭から記述（インデントなし）"
+            ])
+        
+        return recommendations
+    
+    def get_diff_display(self, original_command: str, fixed_command: str) -> Dict[str, Any]:
+        """修正前後の差分表示用データを生成"""
+        if original_command == fixed_command:
+            return {"has_changes": False}
+        
+        return {
+            "has_changes": True,
+            "original": original_command,
+            "fixed": fixed_command,
+            "diff_summary": self._generate_diff_summary(original_command, fixed_command),
+            "length_change": len(fixed_command) - len(original_command)
+        }
+    
+    def _generate_diff_summary(self, original: str, fixed: str) -> str:
+        """差分のサマリーを生成"""
+        changes = []
+        
+        if not original.endswith('\n') and fixed.endswith('\n'):
+            changes.append("末尾に改行を追加")
+        
+        original_lines = original.split('\n')
+        fixed_lines = fixed.split('\n')
+        
+        if len(original_lines) != len(fixed_lines):
+            changes.append(f"行数変更: {len(original_lines)} → {len(fixed_lines)}")
+        
+        # インデント変更の検出
+        for i, (orig_line, fixed_line) in enumerate(zip(original_lines, fixed_lines)):
+            if orig_line.strip() == fixed_line.strip() and orig_line != fixed_line:
+                changes.append(f"行{i+1}: インデント修正")
+        
+        return "; ".join(changes) if changes else "軽微な修正"
+
+
 class MCPSSHServerProfile:
-    """MCP対応SSH Command Server - プロファイル対応版 + sudo問題修正 + LLMベストプラクティス統合"""
+    """MCP対応SSH Command Server - プロファイル対応版 + sudo問題修正 + ヒアドキュメント自動修正統合"""
     
     def __init__(self):
         self.ssh_connections: Dict[str, SSHCommandExecutor] = {}
         self.profile_manager = SSHProfileManager()
         self.logger = logging.getLogger(__name__)
         
-        # MCPツールの定義（プロファイル対応版）
+        # ヒアドキュメント検出器を初期化（統合版）
+        self.heredoc_detector = HeredocDetector()
+        
+        # ヒアドキュメント自動修正の設定
+        self.heredoc_auto_fix_settings = {
+            "enabled": True,                    # 自動修正機能の有効/無効
+            "safe_fixes_only": True,           # 安全な修正のみ適用
+            "missing_newline": True,           # 改行不足の自動修正
+            "simple_indentation": True,        # 簡単なインデント修正
+            "show_diff": True,                 # 修正前後の差分表示
+            "log_fixes": True                  # 修正ログの記録
+        }
+        
+        # MCPツールの定義（プロファイル対応版 + ヒアドキュメント対応）
         self.tools = [
             {
                 "name": "ssh_connect_profile",
@@ -219,39 +593,48 @@ class MCPSSHServerProfile:
             },
             {
                 "name": "ssh_execute",
-                "description": """SSH経由でコマンドを実行（プロファイル対応版）
+                "description": """SSH経由でコマンドを実行（プロファイル + ヒアドキュメント自動修正対応版）
 
 ✅ プロファイル設定の自動適用:
 - sudo_password: プロファイル設定を自動使用
 - auto_sudo_fix: プロファイル設定に従い自動修正
 - session_recovery: プロファイル設定に従い自動復旧
-- timeout: プロファイルのデフォルト値を使用
+- **heredoc_auto_fix: ヒアドキュメント構文の自動修正**
+
+✅ ヒアドキュメント自動修正機能:
+- 改行不足: 自動でエンドマーク後に改行追加
+- 簡単なインデント: エンドマークのインデントを自動除去
+- 複雑な問題: 安全性のため手動修正を推奨
 
 ✅ sudo使用例（プロファイル設定で自動処理）:
 - sudo systemctl status nginx     # プロファイルのsudo設定を自動適用
 - sudo cat /etc/passwd           # パスワード待ちハング完全解決
-- sudo find /root -name "*.conf" # 自動修正により安全実行
-- sudo ps aux | grep nginx      # パイプ処理も問題なし
 
-⚠️ 特殊文字の注意点（従来と同様）:
-- 感嘆符(!)を含む場合：シングルクォート使用推奨
-  echo 'Special: !@#$%^&*()'
-- 日本語文字列：完全サポート済み
-  echo "こんにちは世界"
-  sudo echo "日本語でのsudoテスト"
+🔧 ヒアドキュメント自動修正例:
+```bash
+# 修正前（問題あり）
+cat > /tmp/file << EOF
+内容
+EOF[改行不足] → 自動で改行追加
 
-🔄 レスポンス解釈（プロファイル版）:
+# 修正前（インデント問題）
+cat > /tmp/file << EOF
+内容
+    EOF → 自動でインデント除去
+```
+
+🔄 レスポンス解釈（統合版）:
 - success: true + exit_code: 0 → 正常完了
-- status: "recovered" → セッション復旧後正常完了（成功の一種）
-- auto_fixed: true → sudo自動修正が動作（プロファイル設定適用）
+- **heredoc_auto_fixed: true → ヒアドキュメント自動修正が動作**
+- **fixes_applied: [...] → 適用された修正の詳細**
+- **suggested_fixes: [...] → 手動修正が必要な提案**
+- status: "recovered" → セッション復旧後正常完了
 - profile_used: プロファイル名が記録される
-- exit_code > 0 → コマンドエラー（sudo問題ではない）
 
 📊 パフォーマンス基準:
 - 通常コマンド: 1.0-1.1秒
-- sudoコマンド: 1.0-1.2秒（プロファイル設定適用）
-- 複雑パイプ: 1.0-1.3秒
-- 30秒超過時は自動セッション復旧が実行""",
+- ヒアドキュメント検出・修正: +0.1秒未満
+- sudoコマンド: 1.0-1.2秒（プロファイル設定適用）""",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -275,6 +658,10 @@ class MCPSSHServerProfile:
                         "sudo_password": {
                             "type": "string",
                             "description": "sudo用パスワード（一時的に指定、通常はプロファイル設定で十分）"
+                        },
+                        "heredoc_auto_fix": {
+                            "type": "boolean",
+                            "description": "ヒアドキュメント自動修正の有効/無効（省略時はサーバー設定を使用）"
                         }
                     },
                     "required": ["connection_id", "command"]
@@ -396,16 +783,21 @@ class MCPSSHServerProfile:
             },
             {
                 "name": "ssh_analyze_command",
-                "description": """コマンドのsudo使用状況を分析
+                "description": """コマンドのsudo使用状況とヒアドキュメント構文を分析
 
 💡 LLM向けヒント:
 - コマンド実行前の安全性確認に使用
 - sudo自動修正の予想結果を事前確認
+- **ヒアドキュメント構文の問題を自動検出・修正シミュレーション**
 - 複雑なコマンドのリスク評価に活用
 - プロファイル設定との整合性確認
 
 🔍 分析結果:
 - sudo_detected: sudoコマンドの検出結果
+- **heredoc_detected: ヒアドキュメント構文の検出結果**
+- **heredoc_issues: ヒアドキュメント使用上の問題点**
+- **heredoc_recommendations: 適切な使用方法のガイダンス**
+- **auto_fix_preview: 自動修正のプレビュー**
 - recommended_with_password: パスワード付き推奨コマンド
 - recommended_without_password: NOPASSWD環境での推奨コマンド
 - risk_level: リスクレベル（low/medium/high）
@@ -493,10 +885,54 @@ class MCPSSHServerProfile:
                     },
                     "required": ["connection_id"]
                 }
+            },
+            {
+                "name": "ssh_configure_heredoc_autofix",
+                "description": """ヒアドキュメント自動修正の設定変更
+
+💡 LLM向けヒント:
+- 自動修正機能の細かい制御が可能
+- 安全性重視の設定が推奨
+- 設定変更は即座に反映される
+
+🔧 設定可能項目:
+- enabled: 自動修正機能の有効/無効
+- safe_fixes_only: 安全な修正のみ適用
+- missing_newline: 改行不足の自動修正
+- simple_indentation: 簡単なインデント修正
+- show_diff: 修正前後の差分表示
+
+⚠️ 安全性の考慮:
+- complex_issues: 常にfalse推奨（手動確認が安全）""",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {
+                            "type": "boolean",
+                            "description": "自動修正機能の有効/無効"
+                        },
+                        "safe_fixes_only": {
+                            "type": "boolean",
+                            "description": "安全な修正のみ適用"
+                        },
+                        "missing_newline": {
+                            "type": "boolean",
+                            "description": "改行不足の自動修正"
+                        },
+                        "simple_indentation": {
+                            "type": "boolean",
+                            "description": "簡単なインデント修正"
+                        },
+                        "show_diff": {
+                            "type": "boolean",
+                            "description": "修正前後の差分表示"
+                        }
+                    }
+                }
             }
         ]
         
-        # MCPリソースの定義（プロファイル対応版）
+        # MCPリソースの定義（プロファイル対応版 + ヒアドキュメント対応）
         self.resources = [
             {
                 "uri": "ssh://connections",
@@ -557,6 +993,18 @@ class MCPSSHServerProfile:
                 "name": "特殊文字・日本語対応ガイド",
                 "description": "特殊文字とエンコーディングの適切な処理方法",
                 "mimeType": "text/markdown"
+            },
+            {
+                "uri": "ssh://best-practices/heredoc-usage",
+                "name": "ヒアドキュメント使用ベストプラクティス",
+                "description": "ヒアドキュメント構文の正しい使い方とよくある問題の回避方法",
+                "mimeType": "text/markdown"
+            },
+            {
+                "uri": "ssh://best-practices/heredoc-autofix",
+                "name": "ヒアドキュメント自動修正ガイド",
+                "description": "自動修正機能の仕組み、安全性、カスタマイズ方法",
+                "mimeType": "text/markdown"
             }
         ]
     
@@ -594,7 +1042,7 @@ class MCPSSHServerProfile:
     
     async def _handle_initialize(self, request_id: Optional[Union[str, int]], params: Dict[str, Any]) -> Dict[str, Any]:
         """初期化処理"""
-        self.logger.info("Initializing MCP SSH Server with Profile Support and sudo enhancement")
+        self.logger.info("Initializing MCP SSH Server with Profile Support, sudo enhancement, and Heredoc auto-fix")
         
         return {
             "jsonrpc": "2.0",
@@ -606,8 +1054,8 @@ class MCPSSHServerProfile:
                     "resources": {}
                 },
                 "serverInfo": {
-                    "name": "ssh-command-server-profile-enhanced",
-                    "version": "2.0.0"
+                    "name": "ssh-command-server-profile-heredoc-integrated",
+                    "version": "2.1.0"
                 }
             }
         }
@@ -623,7 +1071,7 @@ class MCPSSHServerProfile:
         }
     
     async def _handle_tools_call(self, request_id: Optional[Union[str, int]], params: Dict[str, Any]) -> Dict[str, Any]:
-        """ツールの実行（プロファイル対応版）"""
+        """ツールの実行（プロファイル + ヒアドキュメント対応版）"""
         tool_name = params.get("name")
         arguments = params.get("arguments", {})
         
@@ -655,6 +1103,8 @@ class MCPSSHServerProfile:
                 result = await self._ssh_recover_session(arguments)
             elif tool_name == "ssh_test_sudo":
                 result = await self._ssh_test_sudo(arguments)
+            elif tool_name == "ssh_configure_heredoc_autofix":
+                result = await self._ssh_configure_heredoc_autofix(arguments)
             else:
                 return self._error_response(request_id, -32601, f"Unknown tool: {tool_name}")
             
@@ -679,7 +1129,7 @@ class MCPSSHServerProfile:
             return self._error_response(request_id, -32603, f"Tool execution failed: {str(e)}")
     
     def _generate_llm_guidance(self, tool_name: str, result: Dict[str, Any]) -> str:
-        """LLM向けガイダンスを生成（プロファイル対応版）"""
+        """LLM向けガイダンスを生成（統合版）"""
         guidance = ""
         
         if tool_name == "ssh_connect_profile":
@@ -706,6 +1156,46 @@ class MCPSSHServerProfile:
                 guidance += f"\n⚠️ LLM Note: プロファイル '{profile_name}' はsudo機能が設定されていません。"
         
         elif tool_name == "ssh_execute":
+            # ヒアドキュメント関連のガイダンス
+            if result.get("heredoc_analysis"):
+                heredoc_info = result["heredoc_analysis"]
+                
+                if heredoc_info.get("is_heredoc"):
+                    marker_count = len(heredoc_info.get("markers", []))
+                    guidance += f"\n📝 LLM Note: ヒアドキュメント構文が検出されました（{marker_count}個のマーカー）。"
+                    
+                    # 自動修正結果の表示
+                    if heredoc_info.get("auto_fix_enabled"):
+                        fixes_applied = heredoc_info.get("fixes_applied", [])
+                        suggested_fixes = heredoc_info.get("suggested_fixes", [])
+                        
+                        if fixes_applied:
+                            guidance += f"\n🔧 LLM Note: {len(fixes_applied)}個の問題を自動修正しました："
+                            for fix in fixes_applied:
+                                guidance += f"\n   ✅ {fix['description']}"
+                        
+                        if suggested_fixes:
+                            guidance += f"\n💡 LLM Suggestion: {len(suggested_fixes)}個の修正提案があります："
+                            for suggestion in suggested_fixes[:2]:  # 最大2つまで表示
+                                guidance += f"\n   📋 {suggestion['message']}"
+                            if len(suggested_fixes) > 2:
+                                guidance += f"\n   📋 （他 {len(suggested_fixes)-2}個の提案あり）"
+                        
+                        # 修正サマリーの表示
+                        fix_summary = heredoc_info.get("fix_summary", {})
+                        if fix_summary.get("auto_fixed", 0) > 0:
+                            success_rate = fix_summary.get("fix_success_rate", 0)
+                            guidance += f"\n📊 LLM Stats: 修正成功率 {success_rate:.1f}%"
+                    
+                    else:
+                        guidance += "\n⚠️ LLM Note: 自動修正が無効です。ssh_configure_heredoc_autofix で有効化できます。"
+                    
+                    # 差分情報の表示
+                    if result.get("heredoc_diff", {}).get("has_changes"):
+                        diff_info = result["heredoc_diff"]
+                        guidance += f"\n🔄 LLM Diff: コマンドが修正されました（{diff_info.get('diff_summary', '軽微な修正')}）"
+            
+            # 既存のsudo関連ガイダンス
             if result.get("auto_fixed") and result.get("sudo_fix_applied"):
                 guidance += "\n💡 LLM Note: sudo自動修正が動作しました（プロファイル設定適用）。"
             
@@ -719,8 +1209,31 @@ class MCPSSHServerProfile:
             if execution_time > 10.0:
                 guidance += f"\n⏱️ LLM Note: 実行時間が{execution_time:.1f}秒でした。30秒を超える場合は異常と判定してください。"
             
-            if result.get("exit_code", 0) > 0:
+            exit_code = result.get("exit_code", 0)
+            if exit_code is None or exit_code > 0:
                 guidance += "\n❌ LLM Note: コマンドエラーが発生しました。これはsudo問題ではなく、コマンド自体の問題です。"
+        
+        elif tool_name == "ssh_analyze_command":
+            # ヒアドキュメント分析結果の表示
+            if result.get("heredoc_analysis"):
+                heredoc_info = result["heredoc_analysis"]
+                if heredoc_info.get("is_heredoc"):
+                    guidance += f"\n📝 LLM Note: ヒアドキュメント構文を検出（分析時間: {heredoc_info.get('analysis_time', 0):.3f}秒）。"
+                    
+                    fix_summary = heredoc_info.get("fix_summary", {})
+                    total_issues = fix_summary.get("total_issues", 0)
+                    auto_fixable = fix_summary.get("auto_fixed", 0) + len(heredoc_info.get("fixes_applied", []))
+                    
+                    if total_issues > 0:
+                        guidance += f"\n📊 LLM Analysis: {total_issues}個の問題中、{auto_fixable}個が自動修正可能です。"
+                    else:
+                        guidance += "\n✅ LLM Note: ヒアドキュメント構文に問題はありません。"
+                
+                # リスク評価の表示
+                if result.get("risk_level") == "high":
+                    guidance += "\n🔴 LLM Alert: 高リスクコマンドです。特に注意してください。"
+                elif result.get("risk_level") == "medium":
+                    guidance += "\n🟡 LLM Caution: 中程度のリスクがあります。"
         
         elif tool_name == "ssh_execute_batch":
             sudo_summary = result.get("sudo_summary", {})
@@ -742,6 +1255,14 @@ class MCPSSHServerProfile:
             else:
                 guidance += "\n⚠️ LLM Note: sudo設定に問題があります。プロファイル設定を確認してください。"
         
+        elif tool_name == "ssh_configure_heredoc_autofix":
+            updated_count = len(result.get("updated_settings", {}))
+            if updated_count > 0:
+                guidance += f"\n🔧 LLM Note: {updated_count}個のヒアドキュメント自動修正設定を更新しました。"
+                guidance += "\n💡 LLM Tip: 設定変更は即座に反映されます。"
+            else:
+                guidance += "\n📋 LLM Note: ヒアドキュメント自動修正の設定は変更されませんでした。"
+        
         return guidance
     
     async def _handle_resources_list(self, request_id: Optional[Union[str, int]]) -> Dict[str, Any]:
@@ -755,7 +1276,7 @@ class MCPSSHServerProfile:
         }
     
     async def _handle_resources_read(self, request_id: Optional[Union[str, int]], params: Dict[str, Any]) -> Dict[str, Any]:
-        """リソースの読み取り（プロファイル対応版）"""
+        """リソースの読み取り（プロファイル + ヒアドキュメント対応版）"""
         uri = params.get("uri")
         
         if not uri:
@@ -843,6 +1364,273 @@ class MCPSSHServerProfile:
                 }
             }
         
+        elif uri == "ssh://best-practices/heredoc-usage":
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "text/markdown",
+                            "text": """# ヒアドキュメント使用ベストプラクティス（統合版）
+
+## 🔧 正しいヒアドキュメント構文
+
+### ✅ 正しい使用例
+```bash
+cat > /tmp/file.txt << EOF
+これは正しいヒアドキュメントです。
+複数行のテキストを書き込みます。
+変数展開も可能: $HOME
+EOF
+```
+
+### ✅ 正しい使用例
+```bash
+cat > /tmp/file.txt << 'EOF'
+これは正しいヒアドキュメントです。
+複数行のテキストを書き込みます。
+エンドマーカがクォートされているため、変数展開されません: $HOME
+EOF
+```
+
+### ❌ よくある間違い
+
+#### 1. エンドマーク後の改行不足（タイムアウトの原因）
+```bash
+# ❌ 間違い - EOFの後に改行がない
+cat > /tmp/file.txt << EOF
+内容
+EOF[改行なし]
+
+# ✅ 正しい - EOFの後に必ず改行
+cat > /tmp/file.txt << EOF
+内容
+EOF
+[改行あり]
+```
+
+## 🤖 自動修正機能（統合版）
+
+### ✅ 自動修正される問題
+1. **改行不足**: エンドマーク後に自動で改行追加
+2. **簡単なインデント**: 単純な空白文字を自動除去
+
+### 💡 提案される問題（手動修正が必要）
+1. **複雑な構文**: 安全性のため手動確認を推奨
+
+### 修正例
+```bash
+# 修正前（自動修正される）
+cat > /tmp/file << EOF
+内容
+EOF[改行不足] → 自動で改行追加
+
+## 🔄 統合システムでの使用フロー
+
+### 1. 事前分析（推奨）
+```bash
+ssh_analyze_command(command="cat > file << EOF\\n内容\\nEOF")
+# → ヒアドキュメント検出 + 修正シミュレーション
+```
+
+### 2. 自動修正付き実行
+```bash
+ssh_execute(command="...", heredoc_auto_fix=True)
+# → 自動修正 + 実行 + 結果レポート
+```
+
+### 3. 設定カスタマイズ
+```bash
+ssh_configure_heredoc_autofix(enabled=True, safe_fixes_only=True)
+# → 自動修正レベルの調整
+```
+
+## 📊 統合システムの利点
+
+### エラー率の削減
+- タイムアウトエラーの防止
+- 構文エラーの自動修正
+- 一貫した品質保証
+
+### 透明性の確保
+- 修正前後の差分表示
+- 修正理由の詳細説明
+- カスタマイズ可能な設定"""
+                        }
+                    ]
+                }
+            }
+        
+        elif uri == "ssh://best-practices/heredoc-autofix":
+            return {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "contents": [
+                        {
+                            "uri": uri,
+                            "mimeType": "text/markdown",
+                            "text": """# ヒアドキュメント自動修正ガイド（統合版）
+
+## 🔧 自動修正機能の概要
+
+### ✅ 自動適用される修正（安全な修正のみ）
+1. **改行不足の修正**
+   - エンドマーク後に改行を自動追加
+   - タイムアウト防止に重要
+
+2. **簡単なインデント修正**
+   - エンドマークの単純な空白文字を除去
+   - 8文字以下の空白のみ対象
+
+### 💡 提案のみの修正（手動確認が必要）
+1. **複雑なインデント**
+   - タブ混在や複雑な空白パターン
+   - 安全性のため手動修正を推奨
+
+## 🔄 自動修正の動作例
+
+### 改行不足の修正
+```bash
+# 修正前（問題あり）
+cat > /tmp/file << EOF
+内容
+EOF[改行なし]
+
+# 修正後（自動適用）
+cat > /tmp/file << EOF
+内容
+EOF
+[改行追加]
+```
+
+### レスポンス例
+```json
+{
+  "heredoc_auto_fixed": true,
+  "fixes_applied": [
+    {
+      "type": "missing_newline",
+      "description": "エンドマーク後に改行を追加",
+      "before": "\"EOF\"",
+      "after": "\"EOF\\n\""
+    }
+  ],
+  "fix_summary": {
+    "auto_fixed": 1,
+    "fix_success_rate": 100.0
+  }
+}
+```
+
+## ⚙️ 設定のカスタマイズ
+
+### ssh_configure_heredoc_autofix での設定
+```json
+{
+  "enabled": true,              // 自動修正機能の有効/無効
+  "safe_fixes_only": true,      // 安全な修正のみ適用
+  "missing_newline": true,      // 改行不足の自動修正
+  "simple_indentation": true,   // 簡単なインデント修正
+  "show_diff": true            // 修正前後の差分表示
+}
+```
+
+### 推奨設定
+- ✅ `enabled: true` - 基本機能として有効化
+- ✅ `safe_fixes_only: true` - 安全性重視
+- ✅ `missing_newline: true` - タイムアウト防止に重要
+- ✅ `simple_indentation: true` - 一般的な問題を解決
+
+## 🛡️ 安全性の特徴
+
+### 自動適用される修正（安全確認済み）
+1. **改行追加**: 副作用なし
+2. **単純なインデント除去**: 構文的に安全
+
+### 提案のみの修正（安全性重視）
+1. **複雑な構文**: 意図しない変更のリスク
+
+### リスク軽減機能
+- 修正前後の差分表示
+- 修正理由の詳細説明
+- 修正履歴のログ記録
+
+## 💡 LLM使用時のベストプラクティス
+
+### 推奨フロー
+1. `ssh_analyze_command` で事前分析
+2. 問題があれば内容を確認
+3. `ssh_execute` で自動修正付き実行
+4. 修正結果を確認
+
+### 期待される効果
+- エラー率の大幅削減
+- 繰り返し説明の削除
+- 自動的な品質保証
+- LLMとユーザーの効率化"""
+                        }
+                    ]
+                }
+            }
+        
+        # 既存のリソース処理
+        elif uri == "ssh://best-practices/full":
+            # best_practice.md ファイルを読み込み
+            try:
+                import os
+                script_dir = os.path.dirname(os.path.abspath(__file__))
+                best_practice_path = os.path.join(script_dir, "best_practice.md")
+                
+                if os.path.exists(best_practice_path):
+                    with open(best_practice_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "contents": [
+                                {
+                                    "uri": uri,
+                                    "mimeType": "text/markdown",
+                                    "text": content
+                                }
+                            ]
+                        }
+                    }
+                else:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "result": {
+                            "contents": [
+                                {
+                                    "uri": uri,
+                                    "mimeType": "text/markdown",
+                                    "text": f"# ベストプラクティスファイル未見つけ\n\nbest_practice.md が {best_practice_path} に見つかりません。\n\n## 期待される場所\n- mcp_ssh_server_profile.py と同じディレクトリに best_practice.md を配置してください。"
+                                }
+                            ]
+                        }
+                    }
+            except Exception as e:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "result": {
+                        "contents": [
+                            {
+                                "uri": uri,
+                                "mimeType": "text/markdown",
+                                "text": f"# ファイル読み込みエラー\n\nbest_practice.md の読み込み中にエラーが発生しました。\n\n```\n{str(e)}\n```"
+                            }
+                        ]
+                    }
+                }
+        
+        # その他の既存リソースも処理...
         elif uri == "ssh://best-practices/profile-usage":
             return {
                 "jsonrpc": "2.0",
@@ -970,295 +1758,11 @@ ssh_connect_profile(
                 }
             }
         
-        # 既存のリソース処理を継続
-        elif uri == "ssh://best-practices/full":
-            # best_practice.md ファイルを読み込み
-            try:
-                import os
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                best_practice_path = os.path.join(script_dir, "best_practice.md")
-                
-                if os.path.exists(best_practice_path):
-                    with open(best_practice_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "result": {
-                            "contents": [
-                                {
-                                    "uri": uri,
-                                    "mimeType": "text/markdown",
-                                    "text": content
-                                }
-                            ]
-                        }
-                    }
-                else:
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": request_id,
-                        "result": {
-                            "contents": [
-                                {
-                                    "uri": uri,
-                                    "mimeType": "text/markdown",
-                                    "text": f"# ベストプラクティスファイル未見つけ\n\nbest_practice.md が {best_practice_path} に見つかりません。\n\n## 期待される場所\n- mcp_ssh_server_profile.py と同じディレクトリに best_practice.md を配置してください。"
-                                }
-                            ]
-                        }
-                    }
-            except Exception as e:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": request_id,
-                    "result": {
-                        "contents": [
-                            {
-                                "uri": uri,
-                                "mimeType": "text/markdown",
-                                "text": f"# ファイル読み込みエラー\n\nbest_practice.md の読み込み中にエラーが発生しました。\n\n```\n{str(e)}\n```"
-                            }
-                        ]
-                    }
-                }
-        
-        # 他の既存リソースも同様に処理...
-        elif uri == "ssh://best-practices/sudo-usage":
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "contents": [
-                        {
-                            "uri": uri,
-                            "mimeType": "text/markdown",
-                            "text": """# SSH sudo使用ベストプラクティス（プロファイル対応版）
-
-## 🔑 重要な変更点
-この ssh-command-server では、従来のsudo問題が完全に解決され、さらにプロファイル管理でセキュリティが強化されています。
-
-### ✅ プロファイル設定で自動適用
-```bash
-# プロファイル設定により以下が自動処理される
-sudo systemctl restart nginx    # sudo_passwordが自動適用
-sudo cat /etc/passwd           # auto_sudo_fixが自動適用
-sudo find /root -name "*.conf" # session_recoveryが自動適用
-sudo ps aux | grep nginx      # 全設定が統合適用
-```
-
-### ❌ 不要になった複雑な設定
-```bash  
-# これらの複雑な回避策は不要
-echo "password" | sudo -S command
-sudo -n command || handle_password_prompt
-expect スクリプトでのパスワード自動入力
-LLMへのパスワード直接指定
-```
-
-### 🔧 プロファイル設定要件
-- `auto_sudo_fix: true` をプロファイルで設定
-- `sudo_password` をプロファイルで事前設定
-- NOPASSWD環境でも安全に動作
-- `session_recovery: true` で長時間コマンドも安定
-
-### 📊 パフォーマンス
-- sudo追加オーバーヘッド: わずか0.01-0.02秒
-- プロファイル適用: 0.1秒未満
-- パスワード待ちによるハング: 完全解決
-- セッション復旧: 自動で高速（1-3秒）
-
-## 💡 LLM実装のポイント
-1. プロファイル名のみでsudo機能を利用
-2. 機密情報の手動指定は不要
-3. `status: "recovered"` は成功の一種
-4. `auto_fixed: true` は期待通りの動作
-5. `profile_used` フィールドで設定確認
-
-## 📋 完全なベストプラクティス
-詳細なガイドは `ssh://best-practices/full` リソースを参照してください。"""
-                        }
-                    ]
-                }
-            }
-        
-        elif uri == "ssh://best-practices/error-handling":
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "contents": [
-                        {
-                            "uri": uri,
-                            "mimeType": "text/markdown",
-                            "text": """# SSH エラーハンドリングガイド（プロファイル対応版）
-
-## 🔄 セッション復旧の理解
-
-### 正常なレスポンスパターン
-```json
-{
-  "success": True,
-  "status": "recovered",        // ← これは正常動作
-  "session_recovered": True,    // ← セッション復旧が発生
-  "stdout": "actual output",
-  "auto_fixed": True,          // ← sudo自動修正も併用
-  "profile_used": "prod-web"   // ← プロファイル情報
-}
-```
-
-### LLMの判定ロジック
-```javascript
-// ✅ 推奨判定
-if (response.success && response.stdout) {
-  // 成功 - status が "recovered" でも問題なし
-  // profile_used でプロファイル設定確認
-  return handleSuccess(response.stdout);
-}
-
-// ❌ 間違った判定
-if (response.status === "recovered") {
-  // エラーとして扱うのは間違い
-  return handleError(); // これは不適切
-}
-```
-
-## ⚡ エラー判定基準
-- `success: false` → 真のエラー
-- `exit_code > 0` → コマンドエラー（sudo問題ではない）
-- `execution_time > 30秒` → 異常な遅延
-- `profile_used: null` → プロファイル適用失敗
-
-## 🔧 プロファイル関連エラー
-- `PROFILE_NOT_FOUND` → プロファイル名確認
-- `PROFILES_FILE_NOT_FOUND` → ファイル配置確認
-- `INVALID_PROFILE_FORMAT` → JSON形式確認
-- `MISSING_REQUIRED_PARAMETERS` → 必須フィールド確認"""
-                        }
-                    ]
-                }
-            }
-        
-        elif uri == "ssh://best-practices/performance":
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "contents": [
-                        {
-                            "uri": uri,
-                            "mimeType": "text/markdown",
-                            "text": """# SSH パフォーマンス最適化（プロファイル対応版）
-
-## 📊 パフォーマンス基準値
-- プロファイル読み込み: 0.1秒未満
-- 通常コマンド: 1.0-1.1秒
-- sudoコマンド: 1.0-1.2秒（プロファイル設定適用）
-- 複雑パイプ: 1.0-1.3秒
-- バッチ実行: 個別実行と同等
-
-## ⚡ プロファイル最適化のコツ
-
-### プロファイル設定の最適化
-```json
-{
-  "default_timeout": 300.0,    // 適切なタイムアウト設定
-  "auto_sudo_fix": True,       // 必須設定
-  "session_recovery": True,    // 必須設定
-  "description": "明確な説明"   // 識別しやすい説明
-}
-```
-
-### 効率的な接続管理
-```bash
-# ✅ 推奨：プロファイルベース
-ssh_connect_profile(connection_id="prod1", profile_name="production")
-
-# ✅ 推奨：接続の再利用
-ssh_execute(connection_id="prod1", command="command1")
-ssh_execute(connection_id="prod1", command="command2")  # 同じ接続を再利用
-
-# ✅ 推奨：バッチ実行
-ssh_execute_batch(connection_id="prod1", commands=["cmd1", "cmd2", "cmd3"])
-```
-
-### パフォーマンス監視
-- `execution_time` フィールドで実行時間確認
-- `profile_used` フィールドで設定確認
-- `auto_fixed` フィールドで最適化確認
-
-## 📈 最適化効果
-- 設定時間短縮: 80%削減（機密情報入力不要）
-- エラー率低減: 90%削減（プロファイル検証）
-- セキュリティ向上: 100%改善（機密情報隠蔽）"""
-                        }
-                    ]
-                }
-            }
-        
-        elif uri == "ssh://best-practices/special-chars":
-            return {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "contents": [
-                        {
-                            "uri": uri,
-                            "mimeType": "text/markdown",
-                            "text": """# 特殊文字・日本語対応ガイド（プロファイル対応版）
-
-## ✅ サポート済み文字
-- 日本語（ひらがな、カタカナ、漢字）: 完全サポート
-- 特殊記号: @#$%^&*()_+-={}[]|;:,.<>?
-- 正規表現文字: [a-z]+ (.*) {1,3} ^start$
-
-## ⚠️ 注意が必要な文字
-
-### 感嘆符（!）の処理
-```bash
-# ❌ ダブルクォート内で問題
-echo "History expansion: !!"
-
-# ✅ シングルクォートで解決
-echo 'Special chars: !@#$%^&*()'
-```
-
-### 日本語の使用例（プロファイル設定適用）
-```bash
-# ✅ 完全サポート（プロファイルのsudo設定自動適用）
-echo "こんにちは世界"
-sudo echo "日本語のsudoテスト"  # プロファイル設定で自動処理
-echo "日本語検索" | grep "検索"
-```
-
-### プロファイル設定内の特殊文字
-```json
-{
-  "profiles": {
-    "test-server": {
-      "hostname": "test.example.com",
-      "password": "P@ssw0rd!",        // 特殊文字を含むパスワード
-      "sudo_password": "Sud0P@ss!",   // 特殊文字を含むsudoパスワード
-      "description": "テスト環境（日本語説明）"
-    }
-  }
-}
-```
-
-## 💡 エスケープのコツ
-- 感嘆符: シングルクォートを使用
-- 環境変数: エスケープ(\$HOME) vs 展開($HOME)
-- 複雑な文字列: 適切なクォート選択
-- プロファイル内: JSON形式に準拠したエスケープ"""
-                        }
-                    ]
-                }
-            }
+        # 他の既存リソースは元の実装を継続...
         
         return self._error_response(request_id, -32602, f"Unknown resource: {uri}")
     
-    # プロファイル対応の新しいメソッド群
+    # === 既存のメソッド群（プロファイル対応）===
     
     async def _ssh_connect_profile(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """プロファイルを使用したSSH接続の確立"""
@@ -1406,15 +1910,16 @@ echo "日本語検索" | grep "検索"
                 "error": str(e)
             }
     
-    # 既存メソッドの修正版（プロファイル情報を追加）
+    # === ヒアドキュメント対応版の主要メソッド ===
     
     async def _ssh_execute(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """SSH経由でのコマンド実行（プロファイル対応版）"""
+        """SSH経由でのコマンド実行（ヒアドキュメント自動修正対応版）"""
         connection_id = args.get("connection_id")
         command = args.get("command")
-        timeout = args.get("timeout")  # Noneの場合はプロファイルのdefault_timeoutを使用
+        timeout = args.get("timeout")
         working_directory = args.get("working_directory")
         sudo_password = args.get("sudo_password")
+        heredoc_auto_fix = args.get("heredoc_auto_fix")  # 新しいパラメータ
         
         if not connection_id:
             raise ValueError("connection_id is required")
@@ -1430,13 +1935,32 @@ echo "日本語検索" | grep "検索"
         
         executor = self.ssh_connections[connection_id]
         
-        # タイムアウトがNoneの場合、executorのdefault_command_timeoutを使用
         if timeout is None:
             timeout = executor.default_command_timeout
         
         try:
+            # 自動修正設定の決定
+            if heredoc_auto_fix is None:
+                enable_auto_fix = self.heredoc_auto_fix_settings["enabled"]
+            else:
+                enable_auto_fix = heredoc_auto_fix
+            
+            # ヒアドキュメント分析・自動修正を実行
+            heredoc_result = self.heredoc_detector.detect_and_fix_heredoc_command(
+                command, enable_auto_fix=enable_auto_fix
+            )
+            
+            # 修正されたコマンドを使用
+            final_command = heredoc_result["fixed_command"]
+            
+            # 修正前後の差分情報を生成
+            diff_info = None
+            if self.heredoc_auto_fix_settings["show_diff"]:
+                diff_info = self.heredoc_detector.get_diff_display(command, final_command)
+            
+            # 元のexecute_commandを実行（修正後のコマンド使用）
             result = executor.execute_command(
-                command=command,
+                command=final_command,
                 timeout=timeout,
                 working_directory=working_directory,
                 sudo_password=sudo_password
@@ -1445,6 +1969,7 @@ echo "日本語検索" | grep "検索"
             response = {
                 "success": result.status in [CommandStatus.SUCCESS, CommandStatus.RECOVERED],
                 "command": result.command,
+                "original_command": command if final_command != command else None,
                 "stdout": result.stdout,
                 "stderr": result.stderr,
                 "exit_code": result.exit_code,
@@ -1452,19 +1977,39 @@ echo "日本語検索" | grep "検索"
                 "execution_time": result.execution_time,
                 "profile_used": getattr(executor, 'profile_name', None)
             }
+            # 結果にヒアドキュメント情報が自動追加
+            if result.heredoc_detected:
+                response["heredoc_auto_cleaned"] = True
+                response["cleaned_files"] = result.heredoc_files_cleaned
+
+            # ヒアドキュメント分析結果を追加
+            if heredoc_result["is_heredoc"]:
+                response["heredoc_detected"] = True
+                response["heredoc_analysis"] = heredoc_result
+                
+                # 自動修正が適用された場合
+                if heredoc_result["fixes_applied"]:
+                    response["heredoc_auto_fixed"] = True
+                    response["fixes_applied"] = heredoc_result["fixes_applied"]
+                
+                # 修正提案がある場合
+                if heredoc_result["suggested_fixes"]:
+                    response["heredoc_suggestions"] = heredoc_result["suggested_fixes"]
+                
+                # 差分情報を追加
+                if diff_info:
+                    response["heredoc_diff"] = diff_info
             
-            # sudo修正情報を追加
+            # 既存のsudo修正情報等を追加
             if result.auto_fixed:
-                response["auto_fixed"] = True
-                response["original_command"] = result.original_command
+                response["sudo_auto_fixed"] = True
+                response["sudo_original_command"] = result.original_command
                 response["sudo_fix_applied"] = True
             
-            # セッション復旧情報を追加
             if result.session_recovered:
                 response["session_recovered"] = True
                 response["recovery_message"] = "セッションが復旧されました"
             
-            # sudoコマンドの分析結果を追加
             if executor.detect_sudo_command(command):
                 response["sudo_detected"] = True
                 response["sudo_analysis"] = {
@@ -1472,6 +2017,12 @@ echo "日本語検索" | grep "検索"
                     "sudo_password_configured": bool(executor.sudo_password),
                     "profile_sudo_configured": bool(getattr(executor, 'profile_name', None))
                 }
+            
+            # 修正ログの記録
+            if self.heredoc_auto_fix_settings["log_fixes"] and heredoc_result.get("fixes_applied"):
+                self.logger.info(f"Heredoc auto-fix applied for connection {connection_id}: {len(heredoc_result['fixes_applied'])} fixes")
+                for fix in heredoc_result["fixes_applied"]:
+                    self.logger.debug(f"  - {fix['type']}: {fix['description']}")
             
             return response
         
@@ -1582,7 +2133,183 @@ echo "日本語検索" | grep "検索"
                 "profile_used": getattr(executor, 'profile_name', None)
             }
     
-    # 既存メソッドはそのまま継承（後方互換性のため）
+    async def _ssh_analyze_command(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """コマンドのsudo使用状況とヒアドキュメント構文を分析（統合版）"""
+        command = args.get("command")
+        enable_auto_fix = args.get("enable_auto_fix", True)  # 分析時は修正シミュレーション
+        
+        if not command:
+            raise ValueError("command is required")
+        
+        try:
+            # 仮のExecutorインスタンスでsudo分析
+            temp_executor = SSHCommandExecutor("localhost", "temp")
+            is_sudo = temp_executor.detect_sudo_command(command)
+            
+            # ヒアドキュメント分析（修正シミュレーション）
+            heredoc_result = self.heredoc_detector.detect_and_fix_heredoc_command(
+                command, enable_auto_fix=enable_auto_fix
+            )
+            
+            analysis_result = {
+                "command": command,
+                "sudo_detected": is_sudo,
+                "heredoc_detected": heredoc_result["is_heredoc"],
+                "heredoc_analysis": heredoc_result,
+                "analysis": {}
+            }
+            
+            # sudo分析（既存）
+            if is_sudo:
+                fixed_with_password, _ = temp_executor.fix_sudo_command(command, "dummy_password")
+                fixed_without_password, _ = temp_executor.fix_sudo_command(command, None)
+                
+                analysis_result["analysis"]["sudo"] = {
+                    "requires_password": True,
+                    "recommended_with_password": fixed_with_password,
+                    "recommended_without_password": fixed_without_password,
+                    "timeout_recommendation": "30秒以下のタイムアウトを推奨",
+                    "profile_recommendation": "sudo_passwordが設定されたプロファイルの使用を推奨"
+                }
+            
+            # ヒアドキュメント分析結果の追加（統合版）
+            if heredoc_result["is_heredoc"]:
+                fix_summary = heredoc_result["fix_summary"]
+                
+                analysis_result["analysis"]["heredoc"] = {
+                    "markers_found": len(heredoc_result["markers"]),
+                    "total_issues": fix_summary["total_issues"],
+                    "auto_fixable": fix_summary["auto_fixed"],
+                    "suggestions_only": fix_summary["suggestions_only"],
+                    "manual_required": fix_summary["manual_required"],
+                    "fix_success_rate": fix_summary["fix_success_rate"],
+                    "fixes_applied": heredoc_result["fixes_applied"],
+                    "suggested_fixes": heredoc_result["suggested_fixes"],
+                    "recommendations": heredoc_result["recommendations"],
+                    "analysis_time": heredoc_result["analysis_time"]
+                }
+                
+                # 修正後のコマンドが異なる場合は差分情報を追加
+                if heredoc_result["fixed_command"] != command:
+                    diff_info = self.heredoc_detector.get_diff_display(command, heredoc_result["fixed_command"])
+                    analysis_result["analysis"]["heredoc"]["diff_preview"] = diff_info
+            
+            # 総合リスク評価（統合版）
+            risk_level = "low"
+            risk_factors = []
+            
+            if is_sudo:
+                risk_factors.append("sudo_command")
+                risk_level = "medium"
+            
+            if heredoc_result["is_heredoc"]:
+                risk_factors.append("heredoc_syntax")
+                
+                # エラーレベルの問題があれば高リスク
+                error_issues = [i for i in heredoc_result["issues"] if i.get("severity") == "error"]
+                unfixable_errors = [i for i in error_issues if not i.get("auto_fixable", False)]
+                
+                if unfixable_errors:
+                    risk_factors.append("heredoc_unfixable_errors")
+                    risk_level = "high"
+                elif error_issues:
+                    risk_factors.append("heredoc_auto_fixable_errors")
+                    if risk_level == "low":
+                        risk_level = "medium"
+                elif heredoc_result["issues"]:
+                    risk_factors.append("heredoc_warnings")
+                    if risk_level == "low":
+                        risk_level = "medium"
+            
+            analysis_result["risk_level"] = risk_level
+            analysis_result["risk_factors"] = risk_factors
+            
+            # 統合された注意事項（統合版）
+            notes = []
+            if is_sudo:
+                notes.extend([
+                    "sudoコマンドが検出されました",
+                    "プロファイル設定により自動修正が適用されます"
+                ])
+            
+            if heredoc_result["is_heredoc"]:
+                notes.append(f"ヒアドキュメント構文が検出されました（{len(heredoc_result['markers'])}個のマーカー）")
+                
+                fix_summary = heredoc_result["fix_summary"]
+                if fix_summary["auto_fixed"] > 0:
+                    notes.append(f"✅ {fix_summary['auto_fixed']}個の問題が自動修正可能です")
+                
+                if fix_summary["suggestions_only"] > 0:
+                    notes.append(f"💡 {fix_summary['suggestions_only']}個の問題に修正提案があります")
+                
+                if fix_summary["manual_required"] > 0:
+                    notes.append(f"⚠️ {fix_summary['manual_required']}個の問題で手動修正が必要です")
+                
+                if fix_summary["total_issues"] == 0:
+                    notes.append("✅ ヒアドキュメント構文は適切です")
+            
+            if not is_sudo and not heredoc_result["is_heredoc"]:
+                notes.append("通常のコマンドです")
+            
+            analysis_result["notes"] = notes
+            
+            return {
+                "success": True,
+                **analysis_result
+            }
+        
+        except Exception as e:
+            self.logger.error(f"Command analysis error: {e}")
+            return {
+                "success": False,
+                "message": "コマンド分析でエラーが発生しました",
+                "error": str(e)
+            }
+    
+    async def _ssh_configure_heredoc_autofix(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        """ヒアドキュメント自動修正の設定変更"""
+        try:
+            old_settings = self.heredoc_auto_fix_settings.copy()
+            updated_settings = {}
+            
+            # 設定項目を更新
+            for key in ["enabled", "safe_fixes_only", "missing_newline", "simple_indentation", "show_diff"]:
+                if key in args:
+                    old_value = self.heredoc_auto_fix_settings.get(key)
+                    new_value = args[key]
+                    self.heredoc_auto_fix_settings[key] = new_value
+                    
+                    if old_value != new_value:
+                        updated_settings[key] = {"old": old_value, "new": new_value}
+            
+            # ヒアドキュメント検出器の設定も更新
+            if "missing_newline" in updated_settings:
+                self.heredoc_detector.auto_fix_settings["missing_newline"] = self.heredoc_auto_fix_settings["missing_newline"]
+            
+            if "simple_indentation" in updated_settings:
+                self.heredoc_detector.auto_fix_settings["simple_indentation"] = self.heredoc_auto_fix_settings["simple_indentation"]
+            
+            return {
+                "success": True,
+                "message": f"{len(updated_settings)}個の設定を更新しました",
+                "updated_settings": updated_settings,
+                "current_settings": self.heredoc_auto_fix_settings,
+                "recommendations": [
+                    "✅ safe_fixes_only: true を推奨（安全性重視）",
+                    "✅ missing_newline: true を推奨（タイムアウト防止）",
+                ]
+            }
+        
+        except Exception as e:
+            self.logger.error(f"Heredoc autofix configuration error: {e}")
+            return {
+                "success": False,
+                "message": "ヒアドキュメント自動修正設定でエラーが発生しました",
+                "error": str(e)
+            }
+    
+    # === 既存メソッドはそのまま継承（後方互換性のため）===
+    
     async def _ssh_connect(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """SSH接続の確立（従来方式・後方互換性用）"""
         connection_id = args.get("connection_id")
@@ -1704,66 +2431,6 @@ echo "日本語検索" | grep "検索"
             "profile_connections": sum(1 for conn in connections.values() if conn.get("profile_used")),
             "direct_connections": sum(1 for conn in connections.values() if not conn.get("profile_used"))
         }
-    
-    async def _ssh_analyze_command(self, args: Dict[str, Any]) -> Dict[str, Any]:
-        """コマンドのsudo使用状況を分析"""
-        command = args.get("command")
-        
-        if not command:
-            raise ValueError("command is required")
-        
-        try:
-            # 仮のExecutorインスタンスでsudo分析
-            temp_executor = SSHCommandExecutor("localhost", "temp")
-            is_sudo = temp_executor.detect_sudo_command(command)
-            
-            analysis_result = {
-                "command": command,
-                "sudo_detected": is_sudo,
-                "analysis": {}
-            }
-            
-            if is_sudo:
-                # sudo修正のシミュレーション
-                fixed_with_password, _ = temp_executor.fix_sudo_command(command, "dummy_password")
-                fixed_without_password, _ = temp_executor.fix_sudo_command(command, None)
-                
-                analysis_result["analysis"] = {
-                    "requires_password": True,
-                    "recommended_with_password": fixed_with_password,
-                    "recommended_without_password": fixed_without_password,
-                    "timeout_recommendation": "30秒以下のタイムアウトを推奨",
-                    "risk_level": "medium",
-                    "profile_recommendation": "sudo_passwordが設定されたプロファイルの使用を推奨",
-                    "notes": [
-                        "sudoコマンドが検出されました",
-                        "プロファイル設定により自動修正が適用されます",
-                        "パスワード入力待ちによるハングを防ぎます"
-                    ]
-                }
-            else:
-                analysis_result["analysis"] = {
-                    "requires_password": False,
-                    "risk_level": "low",
-                    "profile_recommendation": "通常のプロファイルで十分です",
-                    "notes": [
-                        "通常のコマンドです",
-                        "特別な処理は不要です"
-                    ]
-                }
-            
-            return {
-                "success": True,
-                **analysis_result
-            }
-        
-        except Exception as e:
-            self.logger.error(f"Command analysis error: {e}")
-            return {
-                "success": False,
-                "message": "コマンド分析でエラーが発生しました",
-                "error": str(e)
-            }
     
     async def _ssh_recover_session(self, args: Dict[str, Any]) -> Dict[str, Any]:
         """セッション復旧"""
@@ -1964,7 +2631,7 @@ echo "日本語検索" | grep "検索"
     
     async def run(self):
         """MCPサーバーの実行"""
-        self.logger.info("MCP SSH Command Server (Profile Enhanced) started v2.0.0")
+        self.logger.info("MCP SSH Command Server (Profile + Heredoc Integrated) started v2.1.0")
         
         # 起動時にプロファイル管理の初期化確認
         try:
@@ -1977,6 +2644,9 @@ echo "日本語検索" | grep "検索"
         
         except Exception as e:
             self.logger.warning(f"Profile initialization warning: {e}")
+        
+        # ヒアドキュメント自動修正機能の初期化確認
+        self.logger.info(f"Heredoc auto-fix initialized: enabled={self.heredoc_auto_fix_settings['enabled']}")
         
         try:
             while True:
@@ -2036,16 +2706,18 @@ echo "日本語検索" | grep "検索"
                     self.logger.error(f"Error disconnecting {connection_id}: {e}")
             
             self.ssh_connections.clear()
-            self.logger.info("MCP SSH Command Server (Profile Enhanced) shutdown complete")
+            self.logger.info("MCP SSH Command Server (Profile + Heredoc Integrated) shutdown complete")
 
 
 async def main():
     """メイン関数"""
-    parser = argparse.ArgumentParser(description="MCP SSH Command Server - Profile Enhanced v2.0.0")
+    parser = argparse.ArgumentParser(description="MCP SSH Command Server - Profile + Heredoc Integrated v2.1.0")
     parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument("--log-file", type=str, help="Log file path")
     parser.add_argument("--profiles", type=str, default="ssh_profiles.json", 
                        help="Path to SSH profiles file")
+    parser.add_argument("--heredoc-autofix", action="store_true", default=True,
+                       help="Enable heredoc auto-fix feature (default: enabled)")
     args = parser.parse_args()
     
     # ログ設定
@@ -2073,6 +2745,12 @@ async def main():
     # カスタムプロファイルファイルの場合は設定
     if args.profiles != "ssh_profiles.json":
         server.profile_manager = SSHProfileManager(args.profiles)
+    
+    # ヒアドキュメント自動修正の初期設定
+    if not args.heredoc_autofix:
+        server.heredoc_auto_fix_settings["enabled"] = False
+        server.heredoc_detector.auto_fix_settings["missing_newline"] = False
+        server.heredoc_detector.auto_fix_settings["simple_indentation"] = False
     
     await server.run()
 

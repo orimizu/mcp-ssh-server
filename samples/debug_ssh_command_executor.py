@@ -256,7 +256,7 @@ class SSHCommandExecutor:
             List[str]: クリーンアップされたファイルのリスト
         """
         cleaned_files = []
-        
+        print("ヒアドキュメントのクリーンアップ関数 clean_heredoc_files() が呼ばれました")
         for file_path in target_files:
             try:
                 # マーカーパターンの生成
@@ -444,7 +444,7 @@ class SSHCommandExecutor:
                 
                 # ヒアドキュメントコマンド + 完了マーカーを一括送信
                 full_command = f"{command} && echo '{completion_marker}'"
-                
+                print("full cmd: ", full_command)
                 self.logger.info(f"ヒアドキュメント実行開始: {original_command}")
                 self.shell_channel.send(full_command + '\n')
                 
@@ -469,6 +469,7 @@ class SSHCommandExecutor:
                             
                             # 完了マーカーの検出
                             if completion_marker in line:
+                                print("完了マーカーを検出しました")
                                 command_completed = True
                                 break
                             
@@ -513,6 +514,20 @@ class SSHCommandExecutor:
                     status = CommandStatus.ERROR
                     exit_code = 1
                 
+                # ファイルクリーンアップ（成功時のみ）
+                cleaned_files = []
+                """
+                if (status == CommandStatus.SUCCESS and 
+                    self.heredoc_cleanup and 
+                    heredoc_info["target_files"]):
+                    
+                    self.logger.info(f"ヒアドキュメントファイルクリーンアップ開始: {heredoc_info['target_files']}")
+                    cleaned_files = self.clean_heredoc_files(
+                        heredoc_info["target_files"], 
+                        self.marker_base
+                    )
+                """
+                
                 return CommandResult(
                     stdout=stdout_text,
                     stderr=stderr_text,
@@ -524,7 +539,7 @@ class SSHCommandExecutor:
                     auto_fixed=auto_fixed,
                     session_recovered=session_recovered,
                     heredoc_detected=True,
-                    heredoc_files_cleaned=[]
+                    heredoc_files_cleaned=cleaned_files
                 )
                 
             except Exception as e:
@@ -768,6 +783,8 @@ class SSHCommandExecutor:
         heredoc_info = self.detect_heredoc_command(command)
         
         if heredoc_info["is_heredoc"]:
+            print(f"ヒアドキュメント検出: ")
+            print("cmd: ", command)
             self.logger.info(f"ヒアドキュメント検出: {command[:50]}...")
             return self.execute_heredoc_command(
                 command=command,
@@ -776,6 +793,8 @@ class SSHCommandExecutor:
                 sudo_password=sudo_password
             )
         else:
+            print(f"normal command")
+            print("cmd: ", command)
             return self._execute_normal_command(
                 command=command,
                 timeout=timeout,
